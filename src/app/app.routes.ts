@@ -11,4 +11,5 @@ export const routes: Routes = [
   { path: 'expression-changed', loadComponent: () => import('./demos/expression-changed.component').then(m => m.ExpressionChangedComponent) },
   { path: 'router-demo',        loadComponent: () => import('./demos/router-demo/router-demo.component').then(m => m.RouterDemoComponent) },
   { path: 'async-writes',       loadComponent: () => import('./demos/async-writes/async-writes.component').then(m => m.AsyncWritesComponent) },
+  { path: 'content-projection', loadComponent: () => import('./demos/content-projection/content-projection.component').then(m => m.ContentProjectionComponent) },
 ];

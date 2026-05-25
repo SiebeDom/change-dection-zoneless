@@ -97,6 +97,7 @@ export class App {
     { label: 'Expr. Changed',     icon: 'pi-exclamation-triangle', route: '/expression-changed' },
     { label: 'Router Demo',       icon: 'pi-map',                  route: '/router-demo' },
     { label: 'Async Writes',      icon: 'pi-send',                 route: '/async-writes' },
+    { label: 'Proj. vs Dynamic',  icon: 'pi-clone',                route: '/content-projection' },
   ];
 
   toggleMode() {

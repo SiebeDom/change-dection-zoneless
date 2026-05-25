@@ -126,5 +126,6 @@ export class HomeComponent {
     { route: '/immutability',       icon: 'pi-database',             title: 'Immutability',               description: 'OnPush compares references. Mutating an array or object is invisible to Angular.', tag: 'onpush', tagColor: '#f59e0b' },
     { route: '/onpush-shield',      icon: 'pi-shield',               title: 'OnPush Shield (PrimeNG)',    description: 'An OnPush component shields its entire subtree — even Default-strategy children.', tag: 'onpush', tagColor: '#f59e0b' },
     { route: '/expression-changed', icon: 'pi-exclamation-triangle', title: 'ExpressionChanged error',    description: 'The dev-mode guard that fires when state changes as a side effect of rendering.',  tag: 'devmode', tagColor: '#6b7280' },
+    { route: '/content-projection', icon: 'pi-clone',                title: 'Projection vs Dynamic',      description: 'Why OnPush library hosts are safe for ng-content slots but not for ViewContainerRef.createComponent.', tag: 'onpush', tagColor: '#f59e0b' },
   ];
 }
