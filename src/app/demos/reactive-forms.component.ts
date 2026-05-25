@@ -66,6 +66,58 @@ export class FormsBrokenComponent implements DoCheck, AfterViewInit {
   }
 }
 
+// ── Deceptive: [formControl] + pInputText accidentally schedule CD via @HostListener
+//    Typing appears to work — async updates (setTimeout / HTTP) still break ────────
+@Component({
+  selector: 'app-forms-deceptive',
+  imports: [ReactiveFormsModule, Button, InputTextModule],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div class="component-box">
+      <span class="component-box-label">Deceptive — typing works, async breaks</span>
+      <input pInputText [formControl]="ctrl" placeholder="Type here..." style="width:100%" />
+      <div class="result-row" style="margin-top:0.5rem">
+        <span class="result-label">Uppercase derived value:</span>
+        <span class="result-value">{{ upperCased || '—' }}</span>
+      </div>
+      <div class="result-row">
+        <span class="result-label">CD visits</span>
+        <span class="render-badge">{{ checkCount }}</span>
+      </div>
+      <div style="margin-top:0.5rem">
+        <p-button label="Simulate HTTP (patchValue from setTimeout)" size="small" severity="secondary"
+          (onClick)="simulateHttp()" />
+      </div>
+      <div class="warning-box" style="margin-top:0.75rem">
+        Type something, then click Simulate HTTP and wait — uppercase updates while
+        typing but freezes on the async response.
+      </div>
+    </div>
+  `
+})
+export class FormsDeceptiveComponent implements DoCheck {
+  ctrl = new FormControl('');
+  upperCased = '';
+  checkCount = 0;
+
+  constructor() {
+    this.ctrl.valueChanges.subscribe(v => {
+      this.upperCased = (v ?? '').toUpperCase();
+      // plain property — no markForCheck, but [formControl]'s @HostListener rescues typing
+    });
+  }
+
+  ngDoCheck() { this.checkCount++; }
+
+  simulateHttp() {
+    setTimeout(() => {
+      this.ctrl.patchValue('from http response');
+      this.upperCased = 'FROM HTTP RESPONSE';
+      // patchValue from setTimeout → no Angular event → no CD → stays stale
+    }, 800);
+  }
+}
+
 // ── Fixed with markForCheck ────────────────────────────────────────────────────
 @Component({
   selector: 'app-forms-markforcheck',
@@ -166,7 +218,7 @@ export class FormsToSignalComponent implements DoCheck {
 // ── Main page ─────────────────────────────────────────────────────────────────
 @Component({
   selector: 'app-reactive-forms',
-  imports: [FormsBrokenComponent, FormsMarkForCheckComponent, FormsToSignalComponent],
+  imports: [FormsBrokenComponent, FormsDeceptiveComponent, FormsMarkForCheckComponent, FormsToSignalComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="demo-page">
@@ -184,6 +236,43 @@ export class FormsToSignalComponent implements DoCheck {
 
       <pre class="code-block" style="margin-bottom:1rem">{{ codeProblem }}</pre>
 
+      <!-- ── Deceptive case ─────────────────────────────────────────────────── -->
+      <div class="demo-card" style="margin-bottom:1rem">
+        <div class="demo-card-header neutral">
+          <i class="pi pi-exclamation-triangle"></i>
+          The deceptive case — <code>[formControl]</code> + <code>pInputText</code> appear to fix it, but only for typing
+        </div>
+        <div class="demo-card-body">
+          <pre class="code-block">{{ codeDeceptive }}</pre>
+          <div class="two-col" style="margin-top:0.75rem">
+            <div>
+              <div class="warning-box">
+                <strong>Why typing works in zoneless:</strong>
+                <code>[formControl]</code> attaches <code>DefaultValueAccessor</code>, and
+                <code>pInputText</code> is a directive — both register a
+                <code>@HostListener('input')</code> on the element.
+                When you type, Angular's event-binding system intercepts the DOM event,
+                marks the component dirty, and schedules a CD run automatically —
+                even without Zone.js. So the plain property mutation ends up being rendered
+                as a side-effect of Angular's event handling, not because the subscription
+                is correct.
+              </div>
+              <div class="error-box" style="margin-top:0.5rem">
+                <strong>Where it still breaks:</strong>
+                Programmatic updates — <code>patchValue</code> from a
+                <code>setTimeout</code> or HTTP callback — bypass Angular's event system
+                entirely. The subscription fires and <code>upperCased</code> is updated
+                in memory, but no CD is scheduled and the template stays stale.
+                Click <em>Simulate HTTP</em> in the panel to see this.
+              </div>
+            </div>
+            <app-forms-deceptive />
+          </div>
+        </div>
+      </div>
+
+      <!-- ── True broken vs fixed comparison ───────────────────────────────── -->
+      <div class="section-label">Broken (no directives) vs fixed</div>
       <div class="three-col">
         <app-forms-broken />
         <app-forms-markforcheck />
@@ -206,6 +295,18 @@ setTimeout(() => {
   this.form.patchValue(serverData);
   this.displayName = serverData.name; // no markForCheck → stale view
 }, 800);`;
+
+  readonly codeDeceptive = `// ⚠ Deceptive — same broken subscription, but [formControl] masks the problem for typing
+this.ctrl.valueChanges.subscribe(v => {
+  this.upperCased = v.toUpperCase(); // plain property, no markForCheck
+});
+// template: <input pInputText [formControl]="ctrl" />
+//
+// [formControl] → DefaultValueAccessor  )  both have @HostListener('input')
+// pInputText   → InputText directive   )  → Angular marks component dirty on keystrokes
+//
+// Async updates are NOT rescued:
+// setTimeout(() => { this.ctrl.patchValue(data); }, 800); // ← still stale`;
 
   readonly codeFixes = `// Fix 1: explicit markForCheck (works in both Zone.js and zoneless)
 this.ctrl.valueChanges.subscribe(v => {
