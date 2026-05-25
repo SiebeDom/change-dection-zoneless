@@ -1,30 +1,54 @@
 import {
-  ChangeDetectionStrategy, ChangeDetectorRef, Component,
-  DoCheck, inject, OnDestroy, signal
+  ChangeDetectionStrategy, Component,
+  DoCheck, OnDestroy, signal, ViewChild
 } from '@angular/core';
 import { Button } from 'primeng/button';
 import { OnpushChildComponent } from './onpush-child.component';
 
-// ── Default-strategy component that shows zone.js vs zoneless for async ───────
+// ── Signal-only cell — lives in its own LView so its signal never forces the
+//    plain-counter parent to re-render in zoneless mode ─────────────────────────
+@Component({
+  selector: 'app-signal-cell',
+  imports: [],
+  template: `
+    <div class="result-row">
+      <span class="result-label">Signal counter (setInterval)</span>
+      <span class="result-value">{{ counter() }}</span>
+    </div>
+    <div class="result-row">
+      <span class="result-label">CD visits (signal cell)</span>
+      <span class="render-badge">{{ checkCount }}</span>
+    </div>
+  `
+})
+export class SignalCellComponent implements DoCheck, OnDestroy {
+  counter = signal(0);
+  checkCount = 0;
+  private interval: ReturnType<typeof setInterval> | null = null;
+
+  start() { this.interval = setInterval(() => this.counter.update(c => c + 1), 1000); }
+  stop()  { if (this.interval) { clearInterval(this.interval); this.interval = null; } }
+  ngDoCheck()  { this.checkCount++; }
+  ngOnDestroy(){ this.stop(); }
+}
+
+// ── Default-strategy component — plain counter only, no signals in template ───
 @Component({
   selector: 'app-async-demo',
-  imports: [Button],
+  imports: [Button, SignalCellComponent],
   // Default strategy — re-checked on every AppRef.tick()
   template: `
-    <div class="component-box" [class.checking]="isChecking">
+    <div class="component-box">
       <span class="component-box-label">Default strategy</span>
 
       <div class="result-row">
         <span class="result-label">Plain counter (setInterval)</span>
         <span class="result-value">{{ plainCounter }}</span>
       </div>
+      <app-signal-cell #signalCell />
       <div class="result-row">
-        <span class="result-label">Signal counter (setInterval)</span>
-        <span class="result-value">{{ signalCounter() }}</span>
-      </div>
-      <div class="result-row">
-        <span class="result-label">CD visits</span>
-        <span class="render-badge" [class.flash]="isChecking">{{ checkCount }}</span>
+        <span class="result-label">CD visits (plain)</span>
+        <span class="render-badge">{{ checkCount }}</span>
       </div>
 
       <div class="btn-row" style="margin-top:0.75rem">
@@ -38,32 +62,25 @@ import { OnpushChildComponent } from './onpush-child.component';
   `
 })
 export class AsyncDemoComponent implements DoCheck, OnDestroy {
-  private cdr = inject(ChangeDetectorRef);
+  @ViewChild('signalCell') signalCell!: SignalCellComponent;
 
   plainCounter = 0;
-  signalCounter = signal(0);
   checkCount = 0;
-  isChecking = false;
   running = false;
   private interval: ReturnType<typeof setInterval> | null = null;
 
-  ngDoCheck() {
-    this.checkCount++;
-    this.isChecking = true;
-    setTimeout(() => { this.isChecking = false; }, 300);
-  }
+  ngDoCheck() { this.checkCount++; }
 
   start() {
     this.running = true;
-    this.interval = setInterval(() => {
-      this.plainCounter++;     // plain mutation — only updates template if CD runs
-      this.signalCounter.update(c => c + 1);  // signal — always schedules CD
-    }, 1000);
+    this.interval = setInterval(() => { this.plainCounter++; }, 1000);
+    this.signalCell.start();
   }
 
   stop() {
     this.running = false;
-    if (this.interval) clearInterval(this.interval);
+    if (this.interval) { clearInterval(this.interval); this.interval = null; }
+    this.signalCell?.stop();
   }
 
   ngOnDestroy() { this.stop(); }
