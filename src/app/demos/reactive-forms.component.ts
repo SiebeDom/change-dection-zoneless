@@ -1,6 +1,6 @@
 import {
-  ChangeDetectionStrategy, ChangeDetectorRef, Component,
-  DoCheck, inject, signal
+  AfterViewInit, ChangeDetectionStrategy, ChangeDetectorRef, Component,
+  DoCheck, ElementRef, inject, signal, ViewChild
 } from '@angular/core';
 import { FormControl, ReactiveFormsModule } from '@angular/forms';
 import { toSignal } from '@angular/core/rxjs-interop';
@@ -10,11 +10,12 @@ import { InputTextModule } from 'primeng/inputtext';
 // ── Broken: property updated in subscribe, no CD notification ─────────────────
 @Component({
   selector: 'app-forms-broken',
-  imports: [ReactiveFormsModule, Button, InputTextModule],
+  imports: [Button],
+  changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="component-box">
       <span class="component-box-label">Broken (zoneless)</span>
-      <input pInputText [formControl]="ctrl" placeholder="Type here..." style="width:100%" />
+      <input #inp class="p-inputtext p-component" placeholder="Type here..." style="width:100%" />
       <div class="result-row" style="margin-top:0.5rem">
         <span class="result-label">Uppercase derived value:</span>
         <span class="result-value">{{ upperCased || '—' }}</span>
@@ -34,8 +35,9 @@ import { InputTextModule } from 'primeng/inputtext';
     </div>
   `
 })
-export class FormsBrokenComponent implements DoCheck {
-  ctrl = new FormControl('');
+export class FormsBrokenComponent implements DoCheck, AfterViewInit {
+  @ViewChild('inp') inputRef!: ElementRef<HTMLInputElement>;
+  private ctrl = new FormControl('');
   upperCased = '';
   checkCount = 0;
 
@@ -46,13 +48,20 @@ export class FormsBrokenComponent implements DoCheck {
     });
   }
 
+  ngAfterViewInit() {
+    // Native addEventListener — not patched by Zone.js → no CD scheduled on input
+    this.inputRef.nativeElement.addEventListener('input', (e: Event) => {
+      this.ctrl.setValue((e.target as HTMLInputElement).value);
+    });
+  }
+
   ngDoCheck() { this.checkCount++; }
 
   simulateHttp() {
     setTimeout(() => {
-      this.ctrl.patchValue('from http response');
-      this.upperCased = 'FROM HTTP RESPONSE';
-      // same problem: setTimeout fires, no CD scheduled
+      this.inputRef.nativeElement.value = 'from http response';
+      this.ctrl.setValue('from http response');
+      // setTimeout fires outside Angular scheduler → no CD scheduled
     }, 800);
   }
 }
