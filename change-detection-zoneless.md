@@ -570,6 +570,152 @@ carsResource = httpResource<Car[]>('/api/cars');
 
 ---
 
+### The Router in zoneless
+
+Angular's Router handles the framework side correctly in zoneless. `RouterOutlet` calls `markForCheck()` internally when swapping the activated component, and `routerLinkActive` is wired to the scheduler. Navigation itself does not require any extra work.
+
+The risk is **developer code that subscribes to Router observables** — the same problem as any RxJS subscription:
+
+```typescript
+// ✗ Broken in zoneless — subscribe mutates plain property, no CD scheduled
+constructor(private route: ActivatedRoute) {
+  this.route.queryParams.subscribe(params => {
+    this.selectedId = params['id'];   // plain property → no scheduler notification
+  });
+
+  this.router.events
+    .pipe(filter(e => e instanceof NavigationEnd))
+    .subscribe(e => {
+      this.lastUrl = (e as NavigationEnd).url; // plain property → broken
+    });
+}
+
+// ✓ Fixed — toSignal bridges the Observable to the scheduler
+private readonly params   = toSignal(this.route.queryParams, { initialValue: {} });
+readonly selectedId       = computed(() => this.params()['id'] ?? 'none');
+
+// ✓ Also fine — snapshot for one-time reads (synchronous, no observable)
+ngOnInit() {
+  this.selectedId = this.route.snapshot.queryParams['id'];
+}
+```
+
+Angular 17+ introduced `withComponentInputBinding()` in the router config. With it, route params and query params flow directly into `@Input()` fields — no subscribe, no `toSignal()`, no lifecycle hook needed:
+
+```typescript
+// app.config.ts
+provideRouter(routes, withComponentInputBinding())
+
+// component.ts
+@Input() id = '';   // Angular maps ?id=42 → this.id = '42' automatically
+```
+
+---
+
+### `firstValueFrom` + `async/await` for write operations
+
+This is the most commonly overlooked zoneless risk because it looks safe but isn't. The pattern is widespread for POST/PUT/DELETE operations.
+
+```typescript
+async onSave() {
+  this.isSaving = true;          // ✓ synchronous, inside click handler → CD scheduled
+
+  const result = await firstValueFrom(   // ← suspends here
+    this.http.post<Order>('/api/orders', this.form.value)
+  );
+
+  // Everything below runs AFTER the HTTP response arrives (new macrotask)
+  this.savedOrder = result;       // ✗ plain property — no CD scheduled
+  this.isSaving   = false;        // ✗ spinner never disappears
+  this.success    = 'Saved!';     // ✗ never shows in the template
+}
+```
+
+`this.isSaving = true` works because it runs synchronously within the click handler, and Angular's event binding schedules a CD microtask before the handler returns. Everything after the `await` runs when the HTTP response arrives — a separate macrotask — with no Zone.js to call `tick()` afterward.
+
+**Fix 1 — signals (preferred):**
+```typescript
+isSaving    = signal(false);
+savedOrder  = signal<Order | null>(null);
+errorMsg    = signal('');
+
+async onSave() {
+  this.isSaving.set(true);
+  try {
+    this.savedOrder.set(
+      await firstValueFrom(this.http.post<Order>('/api/orders', this.form.value))
+    );
+  } catch (e: any) {
+    this.errorMsg.set(e.message);
+  } finally {
+    this.isSaving.set(false);   // signal update → scheduler notified → CD runs
+  }
+}
+```
+
+**Fix 2 — `markForCheck()` in `finally` (pragmatic migration path):**
+```typescript
+async onSave() {
+  this.isSaving = true;
+  try {
+    this.savedOrder = await firstValueFrom(this.http.post('/api/orders', this.form.value));
+  } catch (e: any) {
+    this.errorMsg = e.message;
+  } finally {
+    this.isSaving = false;
+    this.cdr.markForCheck();   // one call covers all mutations above
+  }
+}
+```
+
+The `finally` + `markForCheck()` pattern is a practical migration step: one line per write operation, and you can refactor to signals incrementally. Any uncaught error still leaves the view stale without `finally`, so always use `finally` rather than a trailing `markForCheck()` after the `await`.
+
+---
+
+### Angular APIs that are still RxJS-based — zoneless audit
+
+| API | Risk in zoneless | Safe approach |
+|---|---|---|
+| `ActivatedRoute.params` / `.queryParams` / `.data` / `.url` | ✗ subscribe → broken | `toSignal()`, `.snapshot`, or `withComponentInputBinding()` |
+| `Router.events` | ✗ subscribe → broken | `toSignal()` or avoid |
+| `FormControl.valueChanges` / `statusChanges` | ✗ subscribe → broken | `toSignal()` or `markForCheck()` in subscribe |
+| `QueryList.changes` (`@ViewChildren`, `@ContentChildren`) | ✗ subscribe → broken | `toSignal(this.items.changes)` |
+| `HttpClient` reads | ✓ use `httpResource` | Signal-native, no subscribe needed |
+| `HttpClient` writes (`firstValueFrom` + `await`) | ✗ post-`await` state | Signals or `markForCheck()` in `finally` |
+| `AsyncPipe` | ✓ has `markForCheck()` built in | Works in both modes |
+| `EventEmitter` (`@Output`) | ✓ Angular handles it | No action needed |
+| `BreakpointObserver` (CDK) | ✗ subscribe → broken | `toSignal(breakpointObserver.observe(...))` |
+| `FocusMonitor` (CDK) | ✗ subscribe → broken | `toSignal()` |
+| `Title` / `Meta` service | ✓ synchronous | Fine |
+| NgRx `store.select()` | ✗ subscribe → broken | `store.selectSignal()` (NgRx 16+) |
+
+**`QueryList.changes`** is easy to miss — it fires when `@ViewChildren` or `@ContentChildren` results change:
+
+```typescript
+@ViewChildren(ItemComponent) items!: QueryList<ItemComponent>;
+
+// ✗ Broken in zoneless
+ngAfterViewInit() {
+  this.items.changes.subscribe(() => {
+    this.itemCount = this.items.length; // plain property
+  });
+}
+
+// ✓ Fixed
+readonly itemCount = toSignal(
+  this.items.changes.pipe(startWith(null), map(() => this.items.length)),
+  { initialValue: 0 }
+);
+```
+
+**Audit grep pattern** — catches most subscribe-with-plain-property cases:
+```
+\.subscribe\(.*=>\s*\{?[^}]*this\.\w+\s*=
+```
+For `firstValueFrom` + `await`, search for `await firstValueFrom` and verify that all assignments after the `await` use signals or that `markForCheck()` appears in `finally`.
+
+---
+
 ### `attach()` / `detach()`
 
 `ChangeDetectorRef.detach()` removes a component from the CD tree entirely — Angular will never check it. `attach()` reattaches it. This is an escape hatch for components that manage their own rendering schedule (such as a chart rendering at 60fps). In the vast majority of applications you will never need this. The JeanMeche demo includes these to show the complete API surface — not because they are common.
@@ -737,8 +883,9 @@ A practical, incremental path to zoneless:
 1. **Set OnPush on every component.** This forces you to find every place that relies on Default-strategy catch-all CD. Fix each one with signals, `async` pipe, or `markForCheck()`. AI tooling can automate this step.
 2. **Replace Observables in templates with `toSignal()`.** Usually mechanical — AI tooling handles this well.
 3. **Audit for immutability.** Find all mutations of `@Input()` objects and arrays and replace them with new-reference patterns. AI tooling can flag these.
-4. **Enable zoneless.** In `app.config.ts`, add `provideExperimentalZonelessChangeDetection()` and remove `zone.js` from `polyfills`.
-5. **Verify.** Walk through your app's key flows. Any view that fails to update is a place where a mutation slipped through step 3.
+4. **Audit subscriptions and async/await writes.** Grep for `\.subscribe(` and for `await firstValueFrom`. Any plain property mutation after either needs signals or `markForCheck()`. Pay particular attention to `ActivatedRoute.params/.queryParams`, `router.events`, and `QueryList.changes` subscriptions.
+5. **Enable zoneless.** In `app.config.ts`, switch to `provideZonelessChangeDetection()` and remove `zone.js` from `polyfills`.
+6. **Verify.** Walk through your app's key flows. Any view that fails to update is a place where a mutation slipped through steps 3–4.
 
 ---
 
@@ -797,13 +944,23 @@ Angular's zoneless scheduler uses `queueMicrotask()` (or `Promise.resolve()`) to
 
 ---
 
-## 13. Demos (To Be Added)
+## 13. Demo Application
 
-- **Pure HTML + JavaScript** — manual DOM updates, no framework, to show the baseline problem.
-- **Angular Default strategy** — a car list and detail page; show how many components are checked on each interaction.
-- **Angular OnPush** — same app with OnPush; show what breaks without immutability and what the fix looks like.
-- **Zoneless** — same app with signals and `provideExperimentalZonelessChangeDetection()`; show the clean call stacks.
-- **JeanMeche visualizer walkthrough** — guided tour of the interactive demo with real-world analogies (PrimeNG table, `setTimeout` simulating a backend call, chart library outside the zone).
+The demo app lives in `src/` and runs with `ng serve`. It uses PrimeNG 21 for components and is configured zoneless by default. A toggle in the top-right corner switches between `provideZonelessChangeDetection()` and `provideZoneChangeDetection()` by writing to `localStorage` and reloading — zone.js is always in `polyfills` but Angular only listens to it when the zone provider is active.
+
+### Pages
+
+| Route | What it demonstrates |
+|---|---|
+| `/home` | Overview, key concept summaries, resource links |
+| `/interpolation` | `{{ }}` coerces to string; `[prop]` preserves type. The disabled-button trap. Compiled template output: `ctx`, `rf`, RenderFlags bitmask. |
+| `/cd-triggers` | **Part A:** `setInterval` with plain property vs signal — switch to Zone.js mode to see the plain counter work. **Part B:** OnPush child with plain mutation (broken both modes), `markForCheck`, `detectChanges`, signal. **Part C:** side-by-side API comparison with docs links. |
+| `/reactive-forms` | Three columns: subscribe + plain property (broken) / `markForCheck` fix / `toSignal` fix. "Simulate HTTP" fires a `setTimeout` to show the async case. |
+| `/immutability` | `array.push()` vs `[...array, item]` — OnPush child with `@Input` change counter that flashes on real reference changes. |
+| `/onpush-shield` | PrimeNG DataTable side by side. Parent ticker fires every second. Default-strategy table re-checks on every tick; OnPush table stays at 1 CD visit until a new product reference is passed. |
+| `/expression-changed` | Three columns: `ngAfterViewInit` mutation (throws NG0100 in dev mode) / `Promise.resolve()` defer fix / signal fix. Broken example gated behind a button. |
+| `/router-demo` | `ActivatedRoute.queryParams` subscribe broken vs `toSignal` fix. `router.events` subscribe broken vs `toSignal` fix. `@ViewChildren` QueryList.changes broken vs `toSignal` fix. |
+| `/async-writes` | `firstValueFrom` + `async/await` for POST/PUT. Three columns: plain properties after `await` (broken) / `markForCheck` in `finally` fix / signals fix. |
 
 ---
 
