@@ -1,7 +1,7 @@
 import {
-  AfterViewInit, ChangeDetectionStrategy, ChangeDetectorRef, Component,
-  computed, DoCheck, inject, Input, OnInit, QueryList,
-  signal, ViewChildren
+  AfterViewInit, ChangeDetectionStrategy, Component,
+  computed, DoCheck, inject, Input, QueryList,
+  signal, ViewChild, ViewChildren
 } from '@angular/core';
 import { toSignal } from '@angular/core/rxjs-interop';
 import { ActivatedRoute, NavigationEnd, Router, RouterModule } from '@angular/router';
@@ -20,10 +20,79 @@ export class QueryItemComponent {
   @Input() label = '';
 }
 
+// ── Broken Part A: queryParams subscribe → plain property, no signals ─────────
+// Lives in its own LView so signal-triggered CD on the parent never sweeps it.
+@Component({
+  selector: 'app-broken-qp-cell',
+  imports: [],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div class="result-row">
+      <span class="result-label">Selected ID</span>
+      <span class="result-value">{{ selected || '—' }}</span>
+    </div>
+    <div class="result-row">
+      <span class="result-label">CD visits</span>
+      <span class="render-badge">{{ checkCount }}</span>
+    </div>
+  `
+})
+export class BrokenQpCellComponent implements DoCheck {
+  private route = inject(ActivatedRoute);
+  selected = '';
+  checkCount = 0;
+  constructor() {
+    this.route.queryParams.subscribe(p => { this.selected = p['item'] ?? ''; });
+  }
+  ngDoCheck() { this.checkCount++; }
+}
+
+// ── Broken Part B: router.events subscribe → plain property ──────────────────
+@Component({
+  selector: 'app-broken-events-cell',
+  imports: [],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div class="result-row">
+      <span class="result-label">Last navigation (broken)</span>
+      <span class="result-value" style="font-size:0.78rem">{{ lastUrl || '—' }}</span>
+    </div>
+  `
+})
+export class BrokenEventsCellComponent {
+  private router = inject(Router);
+  lastUrl = '';
+  constructor() {
+    this.router.events
+      .pipe(filter(e => e instanceof NavigationEnd))
+      .subscribe(e => { this.lastUrl = (e as NavigationEnd).urlAfterRedirects; });
+  }
+}
+
+// ── Broken Part C: QueryList.changes subscribe → plain property ───────────────
+@Component({
+  selector: 'app-broken-ql-cell',
+  imports: [],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div class="result-row">
+      <span class="result-label">Item count (broken)</span>
+      <span class="result-value">{{ itemCount }}</span>
+    </div>
+  `
+})
+export class BrokenQlCellComponent {
+  itemCount = 0;
+  wire(ql: QueryList<QueryItemComponent>) {
+    ql.changes.subscribe(() => { this.itemCount = ql.length; });
+  }
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 @Component({
   selector: 'app-router-demo',
-  imports: [Button, RouterModule, QueryItemComponent],
+  imports: [Button, RouterModule, QueryItemComponent,
+            BrokenQpCellComponent, BrokenEventsCellComponent, BrokenQlCellComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="demo-page">
@@ -63,14 +132,7 @@ export class QueryItemComponent {
           </div>
           <div class="demo-card-body">
             <pre class="code-block">{{ codeQueryBroken }}</pre>
-            <div class="result-row">
-              <span class="result-label">Selected ID</span>
-              <span class="result-value">{{ brokenSelected || '—' }}</span>
-            </div>
-            <div class="result-row">
-              <span class="result-label">CD visits</span>
-              <span class="render-badge">{{ brokenCheckCount }}</span>
-            </div>
+            <app-broken-qp-cell />
             <div class="error-box" style="margin-top:0.5rem">
               Zoneless: <code>queryParams</code> emits after navigation completes
               (async). Plain property update → no CD scheduled → stays stale.
@@ -128,10 +190,7 @@ export class QueryItemComponent {
           </div>
           <div class="demo-card-body">
             <pre class="code-block">{{ codeEventsBroken }}</pre>
-            <div class="result-row">
-              <span class="result-label">Last navigation (broken)</span>
-              <span class="result-value" style="font-size:0.78rem">{{ brokenLastUrl || '—' }}</span>
-            </div>
+            <app-broken-events-cell />
           </div>
         </div>
 
@@ -170,10 +229,7 @@ export class QueryItemComponent {
           </div>
           <div class="demo-card-body">
             <pre class="code-block">{{ codeQueryListBroken }}</pre>
-            <div class="result-row">
-              <span class="result-label">Item count (broken)</span>
-              <span class="result-value">{{ brokenItemCount }}</span>
-            </div>
+            <app-broken-ql-cell #brokenQlCell />
             <div class="result-row">
               <span class="result-label">Items rendered</span>
               <span class="result-value">{{ queryLabels().length }}</span>
@@ -210,7 +266,6 @@ export class QueryItemComponent {
 export class RouterDemoComponent implements DoCheck, AfterViewInit {
   private router = inject(Router);
   private route  = inject(ActivatedRoute);
-  private cdr    = inject(ChangeDetectorRef);
 
   // ── Navigation items ────────────────────────────────────────────────────────
   readonly items = [
@@ -227,17 +282,10 @@ export class RouterDemoComponent implements DoCheck, AfterViewInit {
     });
   }
 
-  // ── Part A: Broken — subscribe to queryParams ────────────────────────────────
-  brokenSelected  = '';
-  brokenCheckCount = 0;
-  fixedCheckCount  = 0;
-
   // ── Part A: Fixed — toSignal ──────────────────────────────────────────────
-  private readonly qp      = toSignal(this.route.queryParams, { initialValue: {} as Record<string, string> });
-  readonly selectedSignal  = computed(() => this.qp()['item'] ?? '');
-
-  // ── Part B: Broken — router.events subscribe ─────────────────────────────
-  brokenLastUrl = '';
+  fixedCheckCount = 0;
+  private readonly qp     = toSignal(this.route.queryParams, { initialValue: {} as Record<string, string> });
+  readonly selectedSignal = computed(() => this.qp()['item'] ?? '');
 
   // ── Part B: Fixed — toSignal(router.events) ───────────────────────────────
   readonly lastUrl = toSignal(
@@ -253,45 +301,21 @@ export class RouterDemoComponent implements DoCheck, AfterViewInit {
   private labelCounter = 1;
 
   @ViewChildren(QueryItemComponent) queryItems!: QueryList<QueryItemComponent>;
-
-  brokenItemCount = 0;
+  @ViewChild('brokenQlCell') brokenQlCell!: BrokenQlCellComponent;
 
   readonly fixedItemCount = signal(0);
 
   ngAfterViewInit() {
-    // BROKEN: subscribe → plain property
+    this.brokenQlCell.wire(this.queryItems);
     this.queryItems.changes.subscribe(() => {
-      this.brokenItemCount = this.queryItems.length;  // no markForCheck
-    });
-
-    // FIXED: toSignal — but we can't use toSignal here because it needs injection context
-    // So we use the manual signal + markForCheck approach to show the pattern clearly
-    this.queryItems.changes.subscribe(() => {
-      this.fixedItemCount.set(this.queryItems.length);  // signal → CD scheduled
+      this.fixedItemCount.set(this.queryItems.length);
     });
   }
 
-  ngDoCheck() {
-    this.brokenCheckCount++;
-    this.fixedCheckCount++;
-  }
+  ngDoCheck() { this.fixedCheckCount++; }
 
   addQueryItem()    { this.queryLabels.update(l => [...l, `Item ${this.labelCounter++}`]); }
   removeQueryItem() { this.queryLabels.update(l => l.slice(0, -1)); }
-
-  constructor() {
-    this.route.queryParams.subscribe(params => {
-      this.brokenSelected = params['item'] ?? '';
-      // no markForCheck → broken in zoneless
-    });
-
-    this.router.events
-      .pipe(filter(e => e instanceof NavigationEnd))
-      .subscribe(e => {
-        this.brokenLastUrl = (e as NavigationEnd).urlAfterRedirects;
-        // no markForCheck → broken in zoneless
-      });
-  }
 
   // ── Code snippets ─────────────────────────────────────────────────────────
   readonly codeQueryBroken = `// ✗ Broken — subscribe to queryParams
