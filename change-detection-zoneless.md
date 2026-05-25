@@ -88,6 +88,110 @@ This is not the same as React's Virtual DOM. React builds a new shadow tree on e
 The Angular Compiler Output tool makes this visible — you can see the generated `ɵɵproperty` and `ɵɵtextInterpolate` calls and the slot indices into the LView array:
 [https://jeanmeche.github.io/angular-compiler-output/](https://jeanmeche.github.io/angular-compiler-output/) ([source](https://github.com/JeanMeche/angular-compiler-output))
 
+### TView vs LView
+
+Every component has two companion data structures:
+
+**TView** (Template View) — static, shared between all instances of the same component. Think of it as the class definition. It describes the shape: which index in LView holds which DOM node, how many bindings there are, where directives live.
+
+**LView** (Logical View) — per-instance, the actual flat array. Think of it as the object instance. Stores live state: DOM node references, directive instances, the last-rendered value for each binding.
+
+DOM nodes are stored as **direct JavaScript object references**, not as string IDs. The index is fixed at compile time. `lView[domNodeIndex]` IS the actual DOM node — no lookup needed. When Angular needs to update the DOM, it reads the node reference from LView and calls `renderer.setValue(lView[domNodeIndex], newValue)` directly.
+
+### Template functions and `ctx`
+
+The Angular compiler turns each component template into a **template function**. This is what `ɵɵtextInterpolate1` and friends actually live in:
+
+```javascript
+function MyComponent_Template(rf, ctx) {
+  if (rf & 1) {             // RenderFlags.Create — runs once on first render
+    ɵɵtext(0);              // create text node, store reference in lView
+  }
+  if (rf & 2) {             // RenderFlags.Update — runs on every CD cycle
+    ɵɵtextInterpolate1(
+      ' And this is a dynamic text node: ',
+      ctx.test              // ctx = the component class instance
+    );
+  }
+}
+```
+
+`ctx` is the component class instance — what you call `this` inside the class. Angular passes `lView[CONTEXT]` (index 3 in LView) as the second argument when calling the template function. So `ctx.test` is exactly `this.test` from the class.
+
+### RenderFlags bitmask (`rf & 1`, `rf & 2`)
+
+`rf` is a `RenderFlags` enum:
+
+```typescript
+enum RenderFlags {
+  Create = 0b01,  // decimal 1
+  Update = 0b10,  // decimal 2
+}
+```
+
+`rf & 1` asks: "is the Create bit set?" `rf & 2` asks: "is the Update bit set?"
+
+**Why a bitmask instead of a simple boolean or string check?**
+
+Bitwise AND (`&`) is a single machine instruction — the fastest possible conditional check. Template functions are called on every change detection cycle across potentially thousands of components. The bitmask means one function serves both creation and update, avoiding the overhead of two separate function definitions. It also allows Angular to theoretically pass both flags simultaneously (`rf = 3`) when it wants a component to run both phases in one call.
+
+---
+
+## 2b. The Host Element
+
+When you write a component:
+
+```typescript
+@Component({
+  selector: 'app-card',
+  template: `<div class="wrapper">{{ title }}</div>`
+})
+class CardComponent {
+  @Input() title = '';
+}
+```
+
+And a parent uses it: `<app-card [title]="myTitle"></app-card>`
+
+The resulting DOM is:
+```html
+<app-card>                        ← HOST ELEMENT — belongs to PARENT's LView
+  <div class="wrapper">Hello</div> ← component's template — in CardComponent's own LView
+</app-card>
+```
+
+**The `<app-card>` element is owned by the parent's LView, not the component's own LView.**
+
+The component's template function only controls what is *inside* the host element. To add classes, attributes, styles, or event listeners to `<app-card>` itself you must declare them in the `host` property of the decorator:
+
+```typescript
+@Component({
+  selector: 'app-card',
+  host: {
+    'class': 'card',                     // static class always present
+    '[class.active]': 'isActive',        // dynamic class binding
+    '[attr.role]': '"listitem"',         // attribute binding
+    '(click)': 'onHostClick($event)',    // host event listener
+    '[style.display]': 'hidden ? "none" : "block"',
+  },
+  template: `<div class="wrapper">{{ title }}</div>`
+})
+```
+
+Or with decorator syntax (older style, equivalent):
+```typescript
+@HostBinding('class.active') isActive = false;
+@HostListener('click', ['$event']) onHostClick(e: Event) { ... }
+```
+
+**Why this separation?**
+
+This mirrors the Web Components / Shadow DOM model. The *parent* controls where a component appears and how it fits in layout. The *component* controls what it renders internally. The host element is the handoff point. This boundary makes components composable — a parent can apply `flex`, `margin`, or `position` to the host without the component needing any knowledge of its context.
+
+It also explains two common surprises:
+1. CSS in a component's `styles` array does **not** automatically style the host element — use `:host { }` in the stylesheet, or declare styles in `host`.
+2. `display: block` is not the default for custom elements — browsers treat unknown elements as `display: inline`. If your component should behave like a block element, add `host: { '[style.display]': '"block"' }` or `:host { display: block; }`.
+
 ---
 
 ## 3. Change Detection: The Core Concept
@@ -227,9 +331,55 @@ The DOM is expensive. Batching avoids layout thrashing and unnecessary repaints.
 
 JavaScript is single-threaded, so there are no true race conditions between `markForCheck()` and a CD cycle — they cannot literally run at the same time.
 
-What can happen instead is `ExpressionChangedAfterItHasBeenChecked`. If during a CD cycle a parent is checked and writes a value, and then a child updates that same value during its own check in the same cycle, Angular detects the inconsistency and throws in development mode. This is Angular's protection against a view being in an inconsistent state after a single pass.
+What can happen instead is `ExpressionChangedAfterItHasBeenChecked`.
 
-The practical rule: never change state inside lifecycle hooks that run during CD (like `ngAfterViewChecked`). If you see `ExpressionChangedAfterItHasBeenChecked`, that is where to look.
+### ExpressionChangedAfterItHasBeenChecked
+
+Angular [NG0100](https://angular.dev/errors/NG0100) — development mode only.
+
+After every CD cycle, Angular runs a **second pass** in dev mode and re-evaluates all bindings. If any binding value differs from what was just written to the DOM, it throws. This catches side effects: something rendered, and as a result of rendering, state changed — which means the view is already stale.
+
+**Practical example — lifecycle hook trap:**
+
+```typescript
+@Component({
+  template: `<child [label]="headerText"></child>`
+})
+class ParentComponent implements AfterViewInit {
+  headerText = 'Loading...';
+
+  ngAfterViewInit() {
+    this.headerText = 'Done!'; // triggers the error
+  }
+}
+```
+
+Timeline:
+1. CD runs on parent → evaluates `headerText = 'Loading...'` → passes to child
+2. Child renders
+3. `ngAfterViewInit` fires (Angular calls it *after* all children have rendered)
+4. `headerText` is now `'Done!'`
+5. **Dev-mode second pass** re-evaluates `headerText` → sees `'Done!'` ≠ `'Loading...'` → **throws**
+
+The fix: don't mutate template-bound state in `ngAfterViewInit`. Derive it with `computed()` or move the logic to `ngOnInit`.
+
+**Why it happened more with observables:**
+
+`BehaviorSubject` and `shareReplay(1)` emit **synchronously** on subscription. If you subscribed in `ngOnInit` (which runs during CD) or used the `async` pipe on a synchronously-emitting source, the emission mutated state mid-cycle:
+
+```typescript
+ngOnInit() {
+  // BehaviorSubject emits the current value synchronously here,
+  // inside the CD cycle that's already running
+  this.dataService.value$.subscribe(v => this.displayValue = v);
+}
+```
+
+**Why signals don't have this error:**
+
+Signals are reactive — Angular tracks which template reads which signal. When a signal changes, Angular marks that specific binding as stale. There is no "re-evaluate everything after the fact" second pass. The model is: "I know exactly what changed." More practically, signals encourage deriving state with `computed()` rather than syncing it in lifecycle hooks, removing the primary trigger for this error.
+
+Also see: [Angular docs on NG0100](https://angular.dev/errors/NG0100)
 
 ---
 
@@ -237,11 +387,23 @@ The practical rule: never change state inside lifecycle hooks that run during CD
 
 | Property | `markForCheck()` | `detectChanges()` |
 |---|---|---|
-| **What it does** | Sets a dirty flag on this component and ancestors | Runs a CD cycle synchronously on this component's subtree |
+| **What it does** | Sets a dirty flag on this component and all ancestors | Runs a CD cycle synchronously on this component's subtree |
 | **Scope** | Cooperates with the next global `AppRef.tick()` | Local subtree only, bypasses the global cycle |
-| **Timing** | Async — at the next scheduled CD cycle | Sync — immediately |
-| **Respects OnPush?** | Yes | No — checks the subtree regardless of strategy |
-| **Preferred?** | Yes | Rarely — testing or when an immediate DOM update is unavoidable |
+| **Timing** | Async — at the next scheduled CD cycle | Sync — immediately, DOM updated before next line of code |
+| **Traversal direction** | Upward (marks ancestors) | Downward (checks this component + all descendants) |
+| **Respects OnPush?** | Yes — sets the dirty flag that OnPush checks | No — checks the subtree regardless of strategy |
+| **Preferred?** | Yes | Rarely — testing or when an immediate local DOM update is unavoidable |
+| **Docs** | [ChangeDetectorRef#markForCheck](https://angular.dev/api/core/ChangeDetectorRef#markForCheck) | [ChangeDetectorRef#detectChanges](https://angular.dev/api/core/ChangeDetectorRef#detectChanges) |
+
+#### Apparent conflict: "CD always starts from top" vs `detectChanges()`
+
+The rule "CD always starts from the root" applies to `AppRef.tick()` — the global cycle triggered by Zone.js or the scheduler. `detectChanges()` is an explicit **escape hatch** that runs *local* change detection on a subtree, starting from the called component downward, with no involvement of the root.
+
+These are two distinct mechanisms:
+- `AppRef.tick()` — global, top-down, triggered by the scheduler
+- `detectChanges()` — local, starts at the component, goes down only
+
+In zoneless Angular, local CD is actually the **preferred** model — signals naturally produce local updates without a global cycle. `detectChanges()` is that same concept surfaced as a manual API. The old "CD must start from top" rule was a consequence of Zone.js's global approach, not a fundamental constraint of Angular.
 
 #### Seeing the difference in the JeanMeche demo
 
@@ -253,6 +415,74 @@ In the demo, uncheck Zone.js first (to remove the automatic CD trigger). Then:
 This is the clearest way to see that `markForCheck()` is just a flag and nothing more.
 
 ---
+
+### What triggers CD for RxJS observables and Subjects in Zone.js world?
+
+RxJS has no built-in Angular integration. A `Subject.next()` call by itself does nothing for change detection. What matters is *where and how* the observable emits.
+
+**If the emission happens inside a Zone.js-patched async callback** — the emission is already "inside the zone." Zone.js will trigger `AppRef.tick()` after the callback completes:
+
+```
+setTimeout(() => subject.next('value'), 1000)
+// Zone.js patched setTimeout → emission happens inside zone → tick fires after
+```
+
+**If the emission happens outside the zone** (e.g., `NgZone.runOutsideAngular(...)` or a third-party library that captured native APIs before Zone.js loaded) — Zone.js doesn't see it and no tick fires:
+
+```typescript
+this.ngZone.runOutsideAngular(() => {
+  setInterval(() => this.subject.next(Date.now()), 100);
+  // NO CD triggered — explicitly outside zone
+});
+```
+
+**For `async` pipe** specifically: `async` pipe subscribes to the observable and calls `markForCheck()` every time it emits. Then Zone.js (triggered by whatever caused the emission) fires `AppRef.tick()`. The `markForCheck()` ensures the OnPush component is not skipped during that cycle.
+
+**For Default strategy components**: Zone.js fires a full `AppRef.tick()` on any async event, checking all Default components unconditionally. No `markForCheck()` needed.
+
+**Summary**:
+
+| Scenario | CD triggered? | How? |
+|---|---|---|
+| Subject.next() in click handler | Yes | Zone.js intercepts click event, fires tick after handler |
+| Subject.next() in setTimeout | Yes | Zone.js intercepts setTimeout callback |
+| Subject.next() in HTTP callback (XHR) | Yes | Zone.js intercepts XHR callback |
+| Subject.next() in runOutsideAngular | No | Emission bypasses zone |
+| async pipe subscribes to observable | Yes (if in zone) | async pipe calls markForCheck() + Zone.js fires tick |
+
+### The click event — precise flow
+
+**With Zone.js (OnPush component):**
+
+```
+1. User clicks — Zone.js intercepts (addEventListener was patched)
+2. Angular's event binding calls markForCheck() on the component
+   → sets LViewFlags.Dirty on the component and all ancestors
+3. Click handler runs synchronously (your code)
+4. Handler returns — all synchronous code is done
+5. Promises/microtasks from the handler drain (microtask queue empties)
+6. Zone.js: microtask queue is empty → fires NgZone.onMicrotaskEmpty
+   → AppRef.tick() runs
+7. top-down CD cycle — sees dirty flags → re-checks those components
+```
+
+Key insight: Zone.js does not trigger `tick()` immediately when the click fires. It waits until **all async operations spawned by that task have completed**. If the click handler starts an HTTP request, Zone.js tracks the open XHR and defers `onMicrotaskEmpty` until the response arrives. This is the Zone.js "safety net" — you never get a half-loaded view rendered before the data arrives.
+
+**With Zoneless:**
+
+```
+1. User clicks — Angular's own event listener fires (no Zone.js wrapping)
+2. Angular's event binding calls markForCheck()
+   → sets dirty flag AND notifies ChangeDetectionScheduler
+   → scheduler queues a microtask (Promise.resolve())
+3. Click handler runs synchronously
+4. Handler returns
+5. Microtask fires → AppRef.tick() runs → CD cycle
+```
+
+In zoneless, `tick()` fires after the current synchronous execution, NOT after all outstanding HTTP requests. If you start an HTTP request in the click handler, the first CD cycle runs before the response arrives. When the response arrives, you need a signal or `markForCheck()` to schedule a second cycle. There is no automatic Zone.js safety net.
+
+This is simpler and more explicit: you always know exactly why CD runs. But it shifts responsibility to the developer — state that drives the view must use signals or explicit scheduling.
 
 ### HTTP Observables and change detection — the full picture
 
@@ -512,17 +742,58 @@ A practical, incremental path to zoneless:
 
 ---
 
-## 12. Macro Tasks, Micro Tasks, and Async
+## 12. Macrotasks, Microtasks, and the Event Loop
 
-Angular's async behaviour is layered on the browser's task model. Understanding this helps explain *when* effects and scheduled CD cycles actually run.
+Angular's async behaviour is layered on the browser's task model.
 
-- **Synchronous code** runs to completion before the browser does anything else.
-- **Microtasks** (Promises, `queueMicrotask`) run immediately after the current synchronous task, before the browser renders or handles the next event.
-- **Macrotasks** (`setTimeout`, `setInterval`, `requestAnimationFrame`) are queued and run in a later turn of the event loop.
+### The event loop — what actually runs when
 
-Zone.js patches both microtasks and macrotasks, which is why it can intercept `Promise.then` and `setTimeout` alike. Angular's own scheduler (in zoneless mode) uses microtasks to schedule CD cycles — this is why signal updates feel immediate but are technically async: the update marks things dirty synchronously, and the CD cycle runs at the next microtask checkpoint.
+```
+┌─────────────────────────────────────────────────────────┐
+│  1. Execute next macrotask                              │
+│     (e.g. "fire the click event" — includes all sync   │
+│      code your handler calls)                           │
+├─────────────────────────────────────────────────────────┤
+│  2. Drain microtask queue completely                    │
+│     (every Promise.then, queueMicrotask — all of them, │
+│      including new ones added during this phase)        │
+├─────────────────────────────────────────────────────────┤
+│  3. Browser may render (requestAnimationFrame)          │
+├─────────────────────────────────────────────────────────┤
+│  4. Back to step 1 — next macrotask                    │
+└─────────────────────────────────────────────────────────┘
+```
 
-*A visual / diagram of the event loop with Angular's scheduling points would go well here.*
+**Macrotasks** — one per event loop turn:
+- The currently executing script (a click handler, a timer callback, a network response callback)
+- `setTimeout` / `setInterval` callbacks create new macrotasks
+- Browser events (click, input, fetch response) each arrive as a macrotask
+
+**Microtasks** — drain entirely after every macrotask:
+- `Promise.then` / `async/await`
+- `queueMicrotask()`
+
+### Common misconception
+
+> "Macrotask = synchronous code. Microtask = async code. Macrotasks have priority."
+
+None of these are correct.
+
+- **Synchronous code runs *inside* the current macrotask** — the click handler IS the macrotask. "Sync vs async" is not the same axis as "macrotask vs microtask."
+- **`setTimeout(..., 0)` creates a macrotask** (queued for later). **`Promise.resolve().then(...)` creates a microtask** (runs before the next macrotask). Both are "async" in everyday language, but they live in different queues.
+- **Microtasks drain between every macrotask** — they effectively have *higher* priority in the sense that they always run before the next macrotask starts. "Macrotask gets priority" is backwards.
+
+### Where Angular fits in
+
+Zone.js patches both queues:
+- `Promise.then` (microtask) → Zone.js wrapper
+- `setTimeout` (macrotask) → Zone.js wrapper
+
+Zone.js fires `NgZone.onMicrotaskEmpty` at step 2 — after the macrotask finishes and all its Promises have resolved. This is why Zone.js's CD tick always runs after all async work from the triggering event is complete.
+
+Angular's zoneless scheduler uses `queueMicrotask()` (or `Promise.resolve()`) to schedule CD cycles — this puts them at step 2 as well. Signal updates mark components dirty synchronously, then the microtask fires the actual CD pass.
+
+*A visual diagram of the event loop with Angular's scheduling points would go well here.*
 
 ---
 
@@ -538,20 +809,42 @@ Zone.js patches both microtasks and macrotasks, which is why it can intercept `P
 
 ## 14. Resources
 
-### Must-Watch
+### Angular Official Docs
+
+- **[NG0100 — ExpressionChangedAfterItHasBeenChecked](https://angular.dev/errors/NG0100)**
+- **[ChangeDetectorRef API](https://angular.dev/api/core/ChangeDetectorRef)** — markForCheck, detectChanges, detach, attach
+- **[Runtime performance — OnPush, CD strategy](https://angular.dev/best-practices/runtime-performance)**
+- **[Zoneless guide](https://angular.dev/guide/zoneless)**
+- **[Signals overview](https://angular.dev/guide/signals)**
+- **[Component lifecycle](https://angular.dev/guide/components/lifecycle)**
+
+### Must-Watch Videos
 
 - **[Zoneless Angular — Minko Gechev](https://www.youtube.com/watch?v=ybNj-id0kjY)** — the case for zoneless from Angular's lead developer.
 - **[Angular Change Detection Deep Dive — Minko Gechev](https://www.youtube.com/watch?v=f8sA-i6gkGQ)** — authoritative overview of the whole system.
 - **[Going Zoneless — Angular team](https://www.youtube.com/watch?v=6lF5xMBk1aA)** — the implementation details of zoneless.
+- **[https://www.youtube.com/watch?v=rL-gInxctZs](https://www.youtube.com/watch?v=rL-gInxctZs)** — change detection / zoneless (verify title when watching).
+- **[https://www.youtube.com/watch?v=FvNXnBdIX1M](https://www.youtube.com/watch?v=FvNXnBdIX1M)** — change detection / signals (verify title when watching).
 - **[Immutability in Angular — Deborah Kurata](https://www.youtube.com/watch?v=oqYQG7QMdzw)** — clear explanation of immutability and why it matters with OnPush and signals.
 
-### Must-Read
+### Must-Read Articles
 
-- **Everything you need to know about change detection in Angular** — deep dive by Max Koretskyi (indepth.dev)
-- **Angular Change Detection Explained** — official Angular blog
-- **Change Detection Fundamentals in Angular** — Angular docs, runtime performance section
+- **[A change detection, Zone.js, zoneless, local change detection, and signals story — Enea Jahollari (justangular.com)](https://justangular.com/blog/a-change-detection-zone-js-zoneless-local-change-detection-and-signals-story)** — the best written narrative from Zone.js to zoneless. By Enea Jahollari (push-based.io), not Mathieu Riegler.
+- **[Local change detection and Angular signals in templates in detail (angularwave, Medium)](https://medium.com/angularwave/local-change-detection-and-angular-signals-in-templates-in-details-948283adc36d)** — deep dive into how signal-driven local CD works inside Angular's rendering pipeline.
+- **[How does Angular change detection really work? — Angular University](https://blog.angular-university.io/how-does-angular-2-change-detection-really-work/)** — foundational explanation, explains Zone.js patching and the change detection cycle in detail.
+- **[Everything you need to know about change detection in Angular — Max Koretskyi (indepth.dev)](https://indepth.dev/posts/1053/everything-you-need-to-know-about-change-detection-in-angular)** — the deepest LView/TView internals reference. Older but the internal model is still accurate.
+- **[push-based.io event — A change detection, Zone.js, and signals story](https://push-based.io/event/a-change-detection-zone-js-and-signals-story)** — event/workshop material from Enea Jahollari.
+
+### Key People
+
+- **Matthieu Riegler** ([@Jean__Meche](https://github.com/JeanMeche)) — Angular core contributor, primary author of the zoneless scheduler and local change detection implementation. His tools:
+  - [Angular Change Detection Visualizer](https://jeanmeche.github.io/angular-change-detection/)
+  - [Angular Compiler Output](https://jeanmeche.github.io/angular-compiler-output/)
+- **Enea Jahollari** ([push-based.io](https://push-based.io)) — most published author on the signals + zoneless story in practice.
+- **Max Koretskyi** ([indepth.dev](https://indepth.dev)) — wrote the foundational deep-dives on Angular internals (LView, TView, Zone.js mechanics).
+- **Minko Gechev** — Angular lead, best videos for the "why zoneless" argument.
 
 ### Interactive Tools
 
-- **[Angular Change Detection Visualizer](https://jeanmeche.github.io/angular-change-detection/)** ([source](https://github.com/JeanMeche/angular-change-detection)) — interactive tool to explore how CD propagates through a component tree. Built by Matthieu Riegler (JeanMeche), a core Angular contributor.
-- **[Angular Compiler Output](https://jeanmeche.github.io/angular-compiler-output/)** ([source](https://github.com/JeanMeche/angular-compiler-output)) — see what the Angular compiler generates from templates. Essential for understanding how bindings become CD instructions.
+- **[Angular Change Detection Visualizer](https://jeanmeche.github.io/angular-change-detection/)** ([source](https://github.com/JeanMeche/angular-change-detection)) — interactive tool to explore how CD propagates through a component tree. Built by Matthieu Riegler.
+- **[Angular Compiler Output](https://jeanmeche.github.io/angular-compiler-output/)** ([source](https://github.com/JeanMeche/angular-compiler-output)) — see what the Angular compiler generates from templates. Essential for understanding how bindings become CD instructions (`ɵɵtextInterpolate`, `ɵɵproperty`, `ctx`, LView indices).
